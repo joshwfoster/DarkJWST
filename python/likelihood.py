@@ -3,8 +3,8 @@ Shared Gaussian-process likelihood for the JWST line analyses.
 
 The baseline likelihood has three numerically optimized parameters:
 
-    logamp
-        Base-10 logarithm of the Gaussian-process kernel amplitude.
+    amp
+        Gaussian-process kernel amplitude in physical flux-squared units.
 
     logNerror
         Base-10 logarithm of the multiplicative error rescaling.
@@ -24,6 +24,7 @@ import numpy as np
 import scipy.optimize as opt
 from george import kernels
 from numpy.linalg import LinAlgError
+
 
 ################################
 ###   Validate Fit Data      ###
@@ -107,14 +108,14 @@ def get_nuisance_limits(flux):
 
     amplitude = np.ptp(flux)
 
-    if not np.isfinite(amplitude) or amplitude <= 0:
+    if not np.isfinite(amplitude) or amplitude <= 0.0:
         raise ValueError(
             f"The fitted flux range must be finite and positive, but is {amplitude}."
         )
 
     return {
-        "logamp": (-15.0, np.log10(amplitude**2)),
-        "logNerror": (-2.0, 7.0),
+        "amp": (0.0, 100.0 * amplitude**2),
+        "logNerror": (0.0, 9.0),
     }
 
 
@@ -129,10 +130,21 @@ def find_initial_nuisance_seed(like, nuisance_limits):
     bounds = [nuisance_limits[name] for name in nuisance_names]
 
     def objective(parameters):
-        return like(gagg2=0.0, **dict(zip(nuisance_names, parameters)))
+        return like(
+            gagg2=0.0,
+            **dict(zip(nuisance_names, parameters)),
+        )
 
-    result = opt.differential_evolution(objective, bounds, maxiter=200, popsize=20,
-                                        init="sobol", tol=1e-5, polish=True, seed=0)
+    result = opt.differential_evolution(
+        objective,
+        bounds,
+        maxiter=200,
+        popsize=20,
+        init="sobol",
+        tol=1e-5,
+        polish=True,
+        seed=0,
+    )
 
     if not np.all(np.isfinite(result.x)):
         raise RuntimeError(
@@ -146,23 +158,39 @@ def find_initial_nuisance_seed(like, nuisance_limits):
 
 
 ################################
-###   Build Likelihood       ###
+###   Build Gaussian Process ###
 ################################
 
-def build_gp(wavelength, error, logamp, logNerror, kernel_metric):
+def build_gp(wavelength, error, amp, logNerror, kernel_metric):
     """Construct and compute the Gaussian process."""
 
-    kernel = 10.0**logamp * kernels.ExpSquaredKernel(metric=kernel_metric)
+    kernel = amp * kernels.ExpSquaredKernel(metric=kernel_metric)
+
     gp = george.GP(kernel)
-    gp.compute(wavelength, error * 10.0**logNerror)
+    gp.compute(
+        wavelength,
+        error * 10.0**logNerror,
+    )
 
     return gp
 
 
+################################
+###   Build Likelihood       ###
+################################
 
-
-def build_likelihood(wavelength, flux, error, mass, galactic_l, galactic_b, instrument_index,
-                     forward_model, velocity_parameters, reference_coupling=1e-11):
+def build_likelihood(
+    wavelength,
+    flux,
+    error,
+    mass,
+    galactic_l,
+    galactic_b,
+    instrument_index,
+    forward_model,
+    velocity_parameters,
+    reference_coupling=1e-11,
+):
     """
     Construct the Gaussian-process likelihood for one mass and dataset.
 
@@ -192,7 +220,7 @@ def build_likelihood(wavelength, flux, error, mass, galactic_l, galactic_b, inst
     Returns
     -------
     like : callable
-        Likelihood function returning -2 log L as a function of ``logamp``,
+        Likelihood function returning -2 log L as a function of ``amp``,
         ``logNerror``, and ``gagg2``.
 
     seed0 : dict
@@ -201,17 +229,35 @@ def build_likelihood(wavelength, flux, error, mass, galactic_l, galactic_b, inst
     nuisance_limits : dict
         Bounds used for the numerically optimized nuisance parameters.
     """
-    
-    wavelength, flux, error = validate_likelihood_data(wavelength, flux, error)
 
-    bin_edges = build_dimensionless_bin_edges(wavelength, mass, forward_model.hc)
+    wavelength, flux, error = validate_likelihood_data(
+        wavelength,
+        flux,
+        error,
+    )
 
-    line_width = forward_model.line_FWHM(mass, instrument_index, **velocity_parameters)
+    bin_edges = build_dimensionless_bin_edges(
+        wavelength,
+        mass,
+        forward_model.hc,
+    )
+
+    line_width = forward_model.line_FWHM(
+        mass,
+        instrument_index,
+        **velocity_parameters,
+    )
+
     kernel_metric = (3.0 * line_width) ** 2
 
     reference_line = forward_model.forward_model(
-        bin_edges, galactic_l, galactic_b, reference_coupling, mass,
-        instrument_index, **velocity_parameters
+        bin_edges,
+        galactic_l,
+        galactic_b,
+        reference_coupling,
+        mass,
+        instrument_index,
+        **velocity_parameters,
     )
 
     if reference_line.shape != flux.shape:
@@ -221,17 +267,32 @@ def build_likelihood(wavelength, flux, error, mass, galactic_l, galactic_b, inst
             f"  flux:           {flux.shape}"
         )
 
-    def like(logamp, logNerror, gagg2):
+    def like(amp, logNerror, gagg2):
         residual = flux - gagg2 * reference_line
-    
+
         try:
-            gp = build_gp(wavelength, error, logamp, logNerror, kernel_metric)
+            gp = build_gp(
+                wavelength,
+                error,
+                amp,
+                logNerror,
+                kernel_metric,
+            )
+
             mean = profile_constant_mean(gp, residual)
-            return -2.0 * gp.lnlikelihood(residual - mean)
+
+            return -2.0 * gp.lnlikelihood(
+                residual - mean
+            )
+
         except (ValueError, LinAlgError):
             return 1e30
 
     nuisance_limits = get_nuisance_limits(flux)
-    seed0 = find_initial_nuisance_seed(like, nuisance_limits)
+
+    seed0 = find_initial_nuisance_seed(
+        like,
+        nuisance_limits,
+    )
 
     return like, seed0, nuisance_limits
