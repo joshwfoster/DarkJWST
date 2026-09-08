@@ -1,29 +1,35 @@
 """
 Shared Gaussian-process likelihood for the JWST line analyses.
 
-The baseline likelihood has three numerically optimized parameters:
+The initial zero-signal global search optimizes amp and logNerror, using
+finite search bounds. Its result is converted to amp and Nerror, where
+Nerror = 10**logNerror, before being returned as a local-fit seed.
+
+The returned likelihood has three numerical parameters:
 
     amp
-        Gaussian-process kernel amplitude in physical flux-squared units.
-
-    logNerror
-        Base-10 logarithm of the multiplicative error rescaling.
-
+        Gaussian-process covariance amplitude in physical flux-squared units.
+    Nerror
+        Multiplicative rescaling of the quoted standard-deviation errors.
     gagg2
         Signed dimensionless line-amplitude coordinate. The reference line is
         evaluated at reference_coupling=1e-11 and multiplied by gagg2.
 
-A constant residual mean is profiled analytically at every likelihood
-calculation using generalized least squares. For the fixed-error systematic,
-logNerror is removed and the quoted spectral errors are used directly.
+Local nuisance limits are amp >= 0 and Nerror >= 0, with no upper limits.
+The signal coordinate gagg2 remains signed and unconstrained.
+A constant residual mean is profiled analytically at every evaluation.
 """
 
+import warnings
 
 import george
 import numpy as np
 import scipy.optimize as opt
 from george import kernels
 from numpy.linalg import LinAlgError
+
+
+INVALID_NLL = 1e30
 
 
 ################################
@@ -103,8 +109,8 @@ def profile_constant_mean(gp, residual):
 ###   Nuisance Bounds        ###
 ################################
 
-def get_nuisance_limits(flux):
-    """Return the nuisance-parameter limits used in the analysis."""
+def get_global_nuisance_limits(flux):
+    """Return finite bounds for the global search in (amp, logNerror)."""
 
     amplitude = np.ptp(flux)
 
@@ -115,7 +121,16 @@ def get_nuisance_limits(flux):
 
     return {
         "amp": (0.0, 100.0 * amplitude**2),
-        "logNerror": (0.0, 9.0),
+        "logNerror": (-3.0, 9.0),
+    }
+
+
+def get_nuisance_limits():
+    """Return local-fit bounds in physical (amp, Nerror) coordinates."""
+
+    return {
+        "amp": (0.0, None),
+        "Nerror": (0.0, None),
     }
 
 
@@ -123,16 +138,17 @@ def get_nuisance_limits(flux):
 ###   Initial Nuisance Fit   ###
 ################################
 
-def find_initial_nuisance_seed(like, nuisance_limits):
-    """Find an initial nuisance solution with the signal fixed to zero."""
+def find_initial_nuisance_seed(like, global_limits):
+    """Search in log-error coordinates; return a physical-coordinate seed."""
 
-    nuisance_names = list(nuisance_limits)
-    bounds = [nuisance_limits[name] for name in nuisance_names]
+    bounds = [global_limits["amp"], global_limits["logNerror"]]
 
     def objective(parameters):
+        amp, logNerror = parameters
         return like(
+            amp=amp,
+            Nerror=10.0**logNerror,
             gagg2=0.0,
-            **dict(zip(nuisance_names, parameters)),
         )
 
     result = opt.differential_evolution(
@@ -142,18 +158,34 @@ def find_initial_nuisance_seed(like, nuisance_limits):
         popsize=20,
         init="sobol",
         tol=1e-5,
-        polish=True,
+        polish=False,  # All local optimization is done later in physical coordinates.
         seed=0,
     )
 
-    if not np.all(np.isfinite(result.x)):
+    if (
+        not np.all(np.isfinite(result.x))
+        or not np.isfinite(result.fun)
+        or result.fun >= INVALID_NLL
+    ):
         raise RuntimeError(
-            f"The initial nuisance fit returned nonfinite parameters: {result.x}"
+            "The initial nuisance search did not find a valid likelihood point. "
+            f"Optimizer message: {result.message}"
         )
 
+    if not result.success:
+        warnings.warn(
+            "The global nuisance search did not report convergence; "
+            "using its best finite point as the local-fit seed. "
+            f"Optimizer message: {result.message}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    amp, logNerror = result.x
+
     return {
-        name: float(value)
-        for name, value in zip(nuisance_names, result.x)
+        "amp": float(amp),
+        "Nerror": float(10.0**logNerror),
     }
 
 
@@ -161,16 +193,22 @@ def find_initial_nuisance_seed(like, nuisance_limits):
 ###   Build Gaussian Process ###
 ################################
 
-def build_gp(wavelength, error, amp, logNerror, kernel_metric):
-    """Construct and compute the Gaussian process."""
+def build_gp(wavelength, error, amp, Nerror, kernel_metric):
+    """Construct and compute the GP using physical nuisance coordinates."""
 
-    kernel = amp * kernels.ExpSquaredKernel(metric=kernel_metric)
+    if not np.all(np.isfinite([amp, Nerror])) or amp < 0.0 or Nerror < 0.0:
+        raise ValueError("amp and Nerror must be finite and nonnegative.")
+
+    if amp == 0.0 and Nerror == 0.0:
+        raise LinAlgError("amp and Nerror cannot both vanish: zero covariance.")
+
+    # A missing kernel means zero GP covariance, avoiding log(0) at amp=0.
+    kernel = None if amp == 0.0 else amp * kernels.ExpSquaredKernel(
+        metric=kernel_metric
+    )
 
     gp = george.GP(kernel)
-    gp.compute(
-        wavelength,
-        error * 10.0**logNerror,
-    )
+    gp.compute(wavelength, error * Nerror)
 
     return gp
 
@@ -192,42 +230,38 @@ def build_likelihood(
     reference_coupling=1e-11,
 ):
     """
-    Construct the Gaussian-process likelihood for one mass and dataset.
+    Construct the GP likelihood for one mass and dataset.
+
+    The initial zero-signal search uses (amp, logNerror) with finite bounds.
+    The returned likelihood, seed, and limits use physical (amp, Nerror)
+    coordinates for all subsequent local fits.
 
     Parameters
     ----------
     wavelength, flux, error : array_like
-        Spectral wavelength, flux, and uncertainty arrays over the local fitting window.
-
+        Spectral wavelength, flux, and uncertainty arrays in the fit window.
     mass : float
         Axion mass used to construct the line model.
-
     galactic_l, galactic_b : float
         Galactic longitude and latitude in degrees.
-
     instrument_index
         NIRSpec grating name or MIRI instrument index.
-
     forward_model
         Initialized JWST line forward-model object.
-
     velocity_parameters : dict
-        Parameters passed to ``line_FWHM`` and ``forward_model``.
-
+        Parameters passed to line_FWHM and forward_model.
     reference_coupling : float, optional
         Coupling used to generate the reference line model.
 
     Returns
     -------
     like : callable
-        Likelihood function returning -2 log L as a function of ``amp``,
-        ``logNerror``, and ``gagg2``.
-
+        like(amp, Nerror, gagg2), returning -2 log L with a profiled mean.
     seed0 : dict
-        Initial nuisance-parameter values obtained from the zero-signal fit.
-
+        Initial amp and Nerror values converted from the global search.
     nuisance_limits : dict
-        Bounds used for the numerically optimized nuisance parameters.
+        Local limits: amp in [0, infinity), Nerror in [0, infinity).
+        gagg2 is not bounded by this dictionary.
     """
 
     wavelength, flux, error = validate_likelihood_data(
@@ -267,32 +301,32 @@ def build_likelihood(
             f"  flux:           {flux.shape}"
         )
 
-    def like(amp, logNerror, gagg2):
-        residual = flux - gagg2 * reference_line
+    def like(amp, Nerror, gagg2):
+        if not np.isfinite(gagg2):
+            return INVALID_NLL
 
         try:
-            gp = build_gp(
-                wavelength,
-                error,
-                amp,
-                logNerror,
-                kernel_metric,
-            )
+            with np.errstate(over="raise", invalid="raise", divide="raise"):
+                residual = flux - gagg2 * reference_line
 
-            mean = profile_constant_mean(gp, residual)
+                gp = build_gp(
+                    wavelength,
+                    error,
+                    amp,
+                    Nerror,
+                    kernel_metric,
+                )
 
-            return -2.0 * gp.lnlikelihood(
-                residual - mean
-            )
+                mean = profile_constant_mean(gp, residual)
+                value = -2.0 * gp.lnlikelihood(residual - mean)
 
-        except (ValueError, LinAlgError):
-            return 1e30
+        except (ValueError, LinAlgError, FloatingPointError, OverflowError):
+            return INVALID_NLL
 
-    nuisance_limits = get_nuisance_limits(flux)
+        return float(value) if np.isfinite(value) else INVALID_NLL
 
-    seed0 = find_initial_nuisance_seed(
-        like,
-        nuisance_limits,
-    )
+    global_limits = get_global_nuisance_limits(flux)
+    seed0 = find_initial_nuisance_seed(like, global_limits)
+    nuisance_limits = get_nuisance_limits()
 
     return like, seed0, nuisance_limits
