@@ -43,6 +43,8 @@ import numpy as np
 from astropy.io import fits
 from astroquery.mast import Observations
 
+from crds.sync import SyncScript
+import asdf
 
 ################################
 ###   CRDS Configuration     ###
@@ -71,6 +73,73 @@ def configure_crds(crds_path, crds_server_url=CRDS_SERVER_URL):
     os.environ["CRDS_PATH"] = str(crds_path)
     os.environ["CRDS_SERVER_URL"] = crds_server_url
 
+
+from astroquery.mast import Observations
+
+################################
+###  CRDS Re-Configuration   ###
+################################
+
+def download_x1d(obs_id, download_dir="."):
+    """
+    Download the Level 3 x1d (extracted 1D spectrum) product for a
+    given JWST observation.
+
+    Parameters
+    ----------
+    obs_id : str
+        Observation ID, e.g. "jw03131-o001_t001_nirspec_g140h-f100lp".
+    download_dir : str or Path, optional
+        Directory to download into. Defaults to current directory.
+
+    Returns
+    -------
+    astropy.table.Table
+        Manifest table of downloaded files (includes 'Local Path' column).
+        Empty if no matching products were found.
+    """
+    obs = Observations.query_criteria(obs_id=obs_id)
+    if len(obs) == 0:
+        raise ValueError(f"No observations found for obs_id={obs_id!r}")
+
+    products = Observations.get_product_list(obs)
+
+    x1d = Observations.filter_products(
+        products,
+        productSubGroupDescription="X1D",
+        calib_level=[3],
+    )
+
+    if len(x1d) == 0:
+        raise ValueError(
+            f"No Level 3 x1d products found for obs_id={obs_id!r}. "
+            "Check that this obs_id has been spectroscopically calibrated, "
+            "or inspect `products['productSubGroupDescription']` and "
+            "`products['calib_level']` to see what's actually available."
+        )
+
+    manifest = Observations.download_products(x1d, download_dir=download_dir)
+    return manifest
+
+def change_nirspec_outer_bkg_radii(new_outer_bkg,crds_cache, ref_id = "jw03131-o001_t001_nirspec_g140h-f100lp"):
+    manifest = download_x1d(ref_id)
+
+    local_files = list(manifest["Local Path"])  # from download_x1d()
+    
+    SyncScript([
+        "crds.sync",
+        "--fetch-references",
+        "--dataset-files", *local_files,
+        "--check-files",
+        "--repair-files",
+    ])()
+    
+    with asdf.open(crds_cache + "references/jwst/nirspec/jwst_nirspec_extract1d_0002.asdf") as af:
+        tree = af.tree.copy()
+        tree["data"]["outer_bkg"] = np.full_like(tree["data"]["outer_bkg"], 1.5)
+    
+        new_af = asdf.AsdfFile(tree)
+        new_af.write_to(crds_cache + "references/jwst/nirspec/jwst_nirspec_extract1d_0002.asdf")
 
 ################################
 ###   File Handling          ###
